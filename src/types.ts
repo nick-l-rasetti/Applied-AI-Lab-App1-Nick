@@ -1,81 +1,77 @@
 export interface SalesOrder {
-  quarter: string;
-  region: string;
-  channel: string;
+  id: string;
+  quarter: string; // e.g. 'Q1', 'Q2', 'Q3', 'Q4'
+  region: string;  // e.g. 'North America', 'EMEA', 'APAC', 'LATAM'
+  channel: string; // e.g. 'Direct Sales', 'Online', 'Retail Partner', 'Wholesale'
+  product: string; // e.g. 'Cloud Enterprise', 'Analytics Pro', etc.
+  units: number;
+  discount_pct: number; // 0 to 100 percentage
+  revenue: number;
+}
+
+export interface RegionQuarterMatrix {
+  regions: string[];
+  quarters: string[];
+  // revenue[region][quarter]
+  revenue: Record<string, Record<string, number>>;
+  units: Record<string, Record<string, number>>;
+  discounts: Record<string, Record<string, number[]>>; // array of discounts to compute avg
+  // totals
+  regionTotals: Record<string, number>;
+  quarterTotals: Record<string, number>;
+  grandTotal: number;
+}
+
+export interface ProductImpact {
   product: string;
-  units: number;
-  discount_pct: number;
-  revenue: number;
-  rawIndex?: number;
-}
-
-export interface RegionQuarterMetric {
-  region: string;
-  quarter: string;
-  revenue: number;
-  units: number;
-  discountWeightedSum: number;
-  orderCount: number;
-}
-
-export interface Q2Q3Driver {
-  name: string;
-  q2Rev: number;
-  q3Rev: number;
-  diff: number;
+  q2Revenue: number;
+  q3Revenue: number;
+  diffRevenue: number;
   pctChange: number;
 }
 
-export interface Q2Q3RegionAnalysis {
+export interface ChannelImpact {
+  channel: string;
+  q2Revenue: number;
+  q3Revenue: number;
+  diffRevenue: number;
+  pctChange: number;
+}
+
+export interface RegionQ2Q3Delta {
   region: string;
   q2Revenue: number;
   q3Revenue: number;
-  revenueDiff: number;
-  revenuePctChange: number;
-  absRevenueDiff: number;
-  absRevenuePctChange: number;
+  diffRevenue: number;      // Q3 - Q2
+  absDiffRevenue: number;   // |Q3 - Q2|
+  pctChange: number;        // ((Q3 - Q2) / Q2) * 100
   q2Units: number;
   q3Units: number;
-  unitsDiff: number;
-  unitsPctChange: number;
-  q2AvgDiscount: number;
-  q3AvgDiscount: number;
-  discountDiff: number;
-  topChannelDrivers: Q2Q3Driver[];
-  topProductDrivers: Q2Q3Driver[];
+  diffUnits: number;
+  q2AvgDiscountPct: number;
+  q3AvgDiscountPct: number;
+  productImpacts: ProductImpact[];
+  topProductByDiff?: ProductImpact;
+  channelImpacts: ChannelImpact[];
+  topChannelByDiff?: ChannelImpact;
 }
 
-export interface SalesAggregation {
-  quarters: string[];
-  regions: string[];
-  channels: string[];
-  products: string[];
-  // region -> quarter -> revenue
-  matrix: Record<string, Record<string, number>>;
-  // region -> quarter -> units
-  unitsMatrix: Record<string, Record<string, number>>;
-  // region -> quarter -> avg discount pct
-  discountMatrix: Record<string, Record<string, number>>;
-  // row totals
-  regionTotals: Record<string, number>;
-  // col totals
-  quarterTotals: Record<string, number>;
-  grandTotal: number;
-  // Q2 vs Q3 analysis
+export interface Q2Q3AnalysisResult {
   hasQ2AndQ3: boolean;
-  q2q3Analysis: Q2Q3RegionAnalysis[];
-  largestDollarRegion: Q2Q3RegionAnalysis | null;
-  largestPctRegion: Q2Q3RegionAnalysis | null;
-  totalQ2Revenue: number;
-  totalQ3Revenue: number;
-  totalRevenueDiff: number;
-  totalRevenuePctChange: number;
-  totalOrders: number;
+  regionsAnalyzed: RegionQ2Q3Delta[];
+  mostChangedByAbsolute: RegionQ2Q3Delta | null;
+  mostChangedByPercentage: RegionQ2Q3Delta | null;
+  overallQ2Revenue: number;
+  overallQ3Revenue: number;
+  overallDiffRevenue: number;
+  overallPctChange: number;
+  summaryMessage?: string;
 }
 
-export interface AISummaryResponse {
-  summary: string;
-  sentences: string[];
-  targetRegion: string;
-  source: string;
+export interface CsvParseResult {
+  orders: SalesOrder[];
+  errors: string[];
+  warnings: string[];
+  detectedColumns: string[];
+  totalRows: number;
 }

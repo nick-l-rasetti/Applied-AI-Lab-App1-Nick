@@ -1,138 +1,119 @@
-import express from 'express';
+import express, { Request, Response } from 'express';
+import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const isProd = process.env.NODE_ENV === 'production';
 
 app.use(express.json({ limit: '10mb' }));
 
-// Helper to format currency for the prompt
-function formatUSD(val: number): string {
-  const hasDecimals = Math.abs(val % 1) > 0.001;
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: hasDecimals ? 2 : 0,
-    maximumFractionDigits: 2,
-  }).format(val);
+interface Q2Q3RegionMetrics {
+  region: string;
+  q2Revenue: number;
+  q3Revenue: number;
+  diffRevenue: number;
+  pctChange: number;
+  q2Units: number;
+  q3Units: number;
+  diffUnits: number;
+  q2AvgDiscountPct: number;
+  q3AvgDiscountPct: number;
+  topProductByDiff?: {
+    product: string;
+    q2Revenue: number;
+    q3Revenue: number;
+    diffRevenue: number;
+  };
+  topChannelByDiff?: {
+    channel: string;
+    q2Revenue: number;
+    q3Revenue: number;
+    diffRevenue: number;
+  };
 }
 
-function formatPct(val: number): string {
-  const sign = val > 0 ? '+' : '';
-  return `${sign}${val.toFixed(1)}%`;
+interface AnalysisPayload {
+  mostChangedRegion: Q2Q3RegionMetrics;
+  rankingByAbsoluteChange: Array<{
+    region: string;
+    absDiff: number;
+    diffRevenue: number;
+    pctChange: number;
+  }>;
+  overallQ2Revenue: number;
+  overallQ3Revenue: number;
+  overallDiff: number;
 }
 
-// Gemini API endpoint for Q2 to Q3 3-sentence summary
-app.post('/api/analyze-q2-q3', async (req, res) => {
+// Deterministic 3-sentence fallback generator using the exact calculated numbers
+function generateDeterministicThreeSentenceSummary(payload: AnalysisPayload): string {
+  const { mostChangedRegion } = payload;
+  const isGain = mostChangedRegion.diffRevenue >= 0;
+  const directionWord = isGain ? 'surged' : 'declined';
+  const gainLossWord = isGain ? 'increase' : 'drop';
+
+  const fmtCurrency = (n: number) =>
+    new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD',
+      maximumFractionDigits: 0,
+    }).format(n);
+
+  const fmtPct = (n: number) => `${n >= 0 ? '+' : ''}${n.toFixed(1)}%`;
+
+  // Sentence 1: Region identification with Q2 and Q3 revenue and change
+  const s1 = `Between Q2 and Q3, the ${mostChangedRegion.region} region experienced the greatest revenue shift, where total revenue ${directionWord} by ${fmtCurrency(Math.abs(mostChangedRegion.diffRevenue))} (${fmtPct(mostChangedRegion.pctChange)}), moving from ${fmtCurrency(mostChangedRegion.q2Revenue)} in Q2 to ${fmtCurrency(mostChangedRegion.q3Revenue)} in Q3.`;
+
+  // Sentence 2: Product driver
+  let s2 = '';
+  if (mostChangedRegion.topProductByDiff) {
+    const prod = mostChangedRegion.topProductByDiff;
+    const prodGain = prod.diffRevenue >= 0;
+    s2 = `This shift was primarily propelled by the "${prod.product}" product line, which accounted for a ${fmtCurrency(Math.abs(prod.diffRevenue))} ${prodGain ? 'gain' : 'reduction'} as product revenue shifted from ${fmtCurrency(prod.q2Revenue)} to ${fmtCurrency(prod.q3Revenue)}.`;
+  } else {
+    s2 = `This variance was driven by a net shift of ${Math.abs(mostChangedRegion.diffUnits).toLocaleString()} order units, changing from ${mostChangedRegion.q2Units.toLocaleString()} units in Q2 to ${mostChangedRegion.q3Units.toLocaleString()} units in Q3.`;
+  }
+
+  // Sentence 3: Channel or discount driver
+  let s3 = '';
+  if (mostChangedRegion.topChannelByDiff) {
+    const chan = mostChangedRegion.topChannelByDiff;
+    s3 = `Additionally, the ${chan.channel} sales channel represented the largest conduit for this change with a ${fmtCurrency(Math.abs(chan.diffRevenue))} ${chan.diffRevenue >= 0 ? 'expansion' : 'contraction'} (from ${fmtCurrency(chan.q2Revenue)} to ${fmtCurrency(chan.q3Revenue)}), accompanied by an average discount movement from ${mostChangedRegion.q2AvgDiscountPct.toFixed(1)}% to ${mostChangedRegion.q3AvgDiscountPct.toFixed(1)}%.`;
+  } else {
+    s3 = `Additionally, regional sales volume shifted from ${mostChangedRegion.q2Units.toLocaleString()} units to ${mostChangedRegion.q3Units.toLocaleString()} units, while average promotional discount rates moved from ${mostChangedRegion.q2AvgDiscountPct.toFixed(1)}% to ${mostChangedRegion.q3AvgDiscountPct.toFixed(1)}%.`;
+  }
+
+  return `${s1} ${s2} ${s3}`;
+}
+
+// API endpoint for AI Three-Sentence Summary
+app.post('/api/analyze-summary', async (req: Request, res: Response) => {
   try {
-    const {
-      regionMetrics,
-      largestDollarRegion,
-      largestPctRegion,
-      totalQ2Revenue,
-      totalQ3Revenue,
-      totalRevenueDiff,
-      totalRevenuePctChange,
-      primaryFocusMetric = 'dollar', // 'dollar' or 'percent'
-    } = req.body;
+    const payload = req.body as AnalysisPayload;
 
-    if (!regionMetrics || !Array.isArray(regionMetrics) || regionMetrics.length === 0) {
-      return res.status(400).json({ error: 'Missing or empty regionMetrics payload.' });
+    if (!payload || !payload.mostChangedRegion) {
+      return res.status(400).json({ error: 'Missing calculation payload' });
     }
-
-    const targetRegionInfo = primaryFocusMetric === 'percent' ? largestPctRegion : largestDollarRegion;
-    const targetRegionData = regionMetrics.find(
-      (r: { region: string }) => r.region.toLowerCase() === targetRegionInfo.region.toLowerCase()
-    ) || targetRegionInfo;
-
-    // Structured summary of calculated facts
-    const driverDetails = [
-      `Target Region: ${targetRegionData.region}`,
-      `Q2 Revenue: ${formatUSD(targetRegionData.q2Revenue)}`,
-      `Q3 Revenue: ${formatUSD(targetRegionData.q3Revenue)}`,
-      `Revenue Net Change: ${formatUSD(targetRegionData.revenueDiff)} (${formatPct(targetRegionData.revenuePctChange)})`,
-      `Q2 Units Sold: ${targetRegionData.q2Units.toLocaleString()}`,
-      `Q3 Units Sold: ${targetRegionData.q3Units.toLocaleString()}`,
-      `Units Change: ${targetRegionData.unitsDiff > 0 ? '+' : ''}${targetRegionData.unitsDiff.toLocaleString()} (${formatPct(targetRegionData.unitsPctChange)})`,
-      `Average Discount in Q2: ${targetRegionData.q2AvgDiscount.toFixed(1)}%`,
-      `Average Discount in Q3: ${targetRegionData.q3AvgDiscount.toFixed(1)}% (Shift: ${targetRegionData.discountDiff > 0 ? '+' : ''}${targetRegionData.discountDiff.toFixed(1)} percentage points)`,
-    ];
-
-    if (targetRegionData.topChannelDrivers && targetRegionData.topChannelDrivers.length > 0) {
-      const topCh = targetRegionData.topChannelDrivers[0];
-      driverDetails.push(
-        `Top Channel Impact: ${topCh.channel} channel changed by ${formatUSD(topCh.diff)} from ${formatUSD(topCh.q2Rev)} to ${formatUSD(topCh.q3Rev)}`
-      );
-    }
-
-    if (targetRegionData.topProductDrivers && targetRegionData.topProductDrivers.length > 0) {
-      const topProd = targetRegionData.topProductDrivers[0];
-      driverDetails.push(
-        `Top Product Impact: ${topProd.product} changed by ${formatUSD(topProd.diff)} from ${formatUSD(topProd.q2Rev)} to ${formatUSD(topProd.q3Rev)}`
-      );
-    }
-
-    const allRegionsSummary = regionMetrics
-      .map(
-        (r: { region: string; q2Revenue: number; q3Revenue: number; revenueDiff: number; revenuePctChange: number }) =>
-          `${r.region}: Q2 ${formatUSD(r.q2Revenue)} -> Q3 ${formatUSD(r.q3Revenue)} (${r.revenueDiff >= 0 ? '+' : ''}${formatUSD(r.revenueDiff)}, ${formatPct(r.revenuePctChange)})`
-      )
-      .join('; ');
-
-    const calculatedFactsPrompt = `
-You must analyze ONLY the pre-calculated numbers provided below for Q2 to Q3 sales performance.
-
-CALCULATED METRICS:
-- Overall Total Revenue: Q2 ${formatUSD(totalQ2Revenue)} to Q3 ${formatUSD(totalQ3Revenue)} (Net change: ${totalRevenueDiff >= 0 ? '+' : ''}${formatUSD(totalRevenueDiff)}, ${formatPct(totalRevenuePctChange)})
-- Region with largest change: ${targetRegionData.region}
-- Key Metrics for ${targetRegionData.region}:
-  ${driverDetails.join('\n  ')}
-- All Regions Comparison:
-  ${allRegionsSummary}
-
-STRICT INSTRUCTIONS:
-1. Write EXACTLY three sentences (no more, no fewer than three sentences).
-2. Sentence 1: Identify that ${targetRegionData.region} underwent the largest shift from Q2 to Q3, explicitly stating its Q2 revenue (${formatUSD(targetRegionData.q2Revenue)}), Q3 revenue (${formatUSD(targetRegionData.q3Revenue)}), and the net variance (${formatUSD(targetRegionData.revenueDiff)} or ${formatPct(targetRegionData.revenuePctChange)}).
-3. Sentence 2: Explain WHY it changed using ONLY the exact calculated numbers provided above (such as the shift in units from ${targetRegionData.q2Units.toLocaleString()} to ${targetRegionData.q3Units.toLocaleString()} (${formatPct(targetRegionData.unitsPctChange)}), discount rate change of ${targetRegionData.discountDiff > 0 ? '+' : ''}${targetRegionData.discountDiff.toFixed(1)} percentage points, or specific channel/product movements).
-4. Sentence 3: Contextualize this movement against company-wide performance or contrasting regions using the exact provided totals or other regional figures.
-5. STRICT NUMERICAL ACCURACY: Do NOT invent, round differently, or mention any figures not listed in the calculated metrics. Output plain text only without markdown asterisks or bullet points.
-`;
-
-    const buildFallbackSummary = () => {
-      const diffSign = targetRegionData.revenueDiff >= 0 ? '+' : '';
-      const sentence1 = `${targetRegionData.region} experienced the largest revenue change from Q2 to Q3, moving from ${formatUSD(targetRegionData.q2Revenue)} to ${formatUSD(targetRegionData.q3Revenue)}, a variance of ${diffSign}${formatUSD(targetRegionData.revenueDiff)} (${formatPct(targetRegionData.revenuePctChange)}).`;
-      
-      const channelPart = targetRegionData.topChannelDrivers?.[0]
-        ? ` with the ${targetRegionData.topChannelDrivers[0].channel} channel shifting by ${targetRegionData.topChannelDrivers[0].diff >= 0 ? '+' : ''}${formatUSD(targetRegionData.topChannelDrivers[0].diff)}`
-        : '';
-      const sentence2 = `This change was primarily driven by a volume change of ${targetRegionData.unitsDiff >= 0 ? '+' : ''}${targetRegionData.unitsDiff.toLocaleString()} units (${formatPct(targetRegionData.unitsPctChange)}) alongside an average discount movement from ${targetRegionData.q2AvgDiscount.toFixed(1)}% to ${targetRegionData.q3AvgDiscount.toFixed(1)}%${channelPart}.`;
-      
-      const sentence3 = `In comparison, total company revenue moved from ${formatUSD(totalQ2Revenue)} to ${formatUSD(totalQ3Revenue)} (${formatPct(totalRevenuePctChange)}), highlighting ${targetRegionData.region}'s outsized contribution to overall quarterly dynamics.`;
-
-      return {
-        summary: `${sentence1} ${sentence2} ${sentence3}`,
-        sentences: [sentence1, sentence2, sentence3],
-        targetRegion: targetRegionData.region,
-        source: 'calculated-engine',
-      };
-    };
 
     const apiKey = process.env.GEMINI_API_KEY;
 
-    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.trim() === '') {
-      return res.json(buildFallbackSummary());
+    if (!apiKey) {
+      // Return deterministic fallback if key is unconfigured in environment
+      const fallbackSummary = generateDeterministicThreeSentenceSummary(payload);
+      return res.json({
+        summary: fallbackSummary,
+        source: 'engine_computed',
+        note: 'Calculated directly from order metrics (no Gemini key attached).',
+      });
     }
 
     const ai = new GoogleGenAI({
-      apiKey,
+      apiKey: apiKey,
       httpOptions: {
         headers: {
           'User-Agent': 'aistudio-build',
@@ -140,82 +121,115 @@ STRICT INSTRUCTIONS:
       },
     });
 
-    let outputText = '';
-    // Attempt generation with retry and timeout guard
-    for (let attempt = 0; attempt < 2; attempt++) {
+    const prompt = `You are an executive sales intelligence analyst.
+
+TASK:
+Write an exact THREE-SENTENCE summary explaining which region changed the most from Q2 to Q3 in revenue, and why, using ONLY the verified calculated numbers provided below.
+
+VERIFIED CALCULATED NUMBERS:
+- Most Changed Region: ${payload.mostChangedRegion.region}
+- Q2 Revenue: $${payload.mostChangedRegion.q2Revenue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+- Q3 Revenue: $${payload.mostChangedRegion.q3Revenue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+- Dollar Revenue Delta (Q3 - Q2): $${payload.mostChangedRegion.diffRevenue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+- Percentage Change: ${payload.mostChangedRegion.pctChange.toFixed(2)}%
+- Q2 Order Units: ${payload.mostChangedRegion.q2Units.toLocaleString()}
+- Q3 Order Units: ${payload.mostChangedRegion.q3Units.toLocaleString()}
+- Unit Delta: ${(payload.mostChangedRegion.diffUnits >= 0 ? '+' : '')}${payload.mostChangedRegion.diffUnits.toLocaleString()}
+- Q2 Average Discount Rate: ${payload.mostChangedRegion.q2AvgDiscountPct.toFixed(2)}%
+- Q3 Average Discount Rate: ${payload.mostChangedRegion.q3AvgDiscountPct.toFixed(2)}%
+${
+  payload.mostChangedRegion.topProductByDiff
+    ? `- Top Product Driver: "${payload.mostChangedRegion.topProductByDiff.product}" (Q2 Revenue: $${payload.mostChangedRegion.topProductByDiff.q2Revenue.toLocaleString()}, Q3 Revenue: $${payload.mostChangedRegion.topProductByDiff.q3Revenue.toLocaleString()}, Delta: $${payload.mostChangedRegion.topProductByDiff.diffRevenue.toLocaleString()})`
+    : ''
+}
+${
+  payload.mostChangedRegion.topChannelByDiff
+    ? `- Top Channel Driver: "${payload.mostChangedRegion.topChannelByDiff.channel}" (Q2 Revenue: $${payload.mostChangedRegion.topChannelByDiff.q2Revenue.toLocaleString()}, Q3 Revenue: $${payload.mostChangedRegion.topChannelByDiff.q3Revenue.toLocaleString()}, Delta: $${payload.mostChangedRegion.topChannelByDiff.diffRevenue.toLocaleString()})`
+    : ''
+}
+- Other Regions Q2-to-Q3 Changes: ${payload.rankingByAbsoluteChange.map((r) => `${r.region}: $${r.diffRevenue.toLocaleString()} (${r.pctChange.toFixed(1)}%)`).join(', ')}
+
+STRICT RULES:
+1. The response MUST be EXACTLY THREE SENTENCES. Do not write two sentences, do not write four sentences.
+2. Sentence 1: Identify the region that changed the most from Q2 to Q3, citing its Q2 revenue, Q3 revenue, and the net dollar change or percent change.
+3. Sentence 2: Explain the primary product driver behind this change, quoting the specific product name and its exact numbers.
+4. Sentence 3: Explain the channel or unit/discount factor that explains why the change occurred, citing only the provided numbers.
+5. Use ONLY numbers from the provided list. Do not hallucinate external causes, macroeconomic events, or unlisted data.
+6. Return purely the three sentences. No preamble, no quotes around sentences, no markdown headings, no bullet points.`;
+
+    let aiText = '';
+    let lastError: any = null;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        const timeoutPromise = new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Gemini API timeout')), 6000)
-        );
-
-        const response = await Promise.race([
-          ai.models.generateContent({
-            model: 'gemini-3.8-flash',
-            contents: calculatedFactsPrompt,
-            config: {
-              systemInstruction:
-                'You are an executive finance controller and data auditor. Your job is to summarize quarterly sales changes in strictly three sentences, using exclusively the numbers calculated by the application with zero hallucination.',
-            },
-          }),
-          timeoutPromise,
-        ]);
-
-        outputText = response.text?.trim() || '';
-        if (outputText) break;
-      } catch (err: any) {
-        if (attempt === 0) {
-          // brief pause before retry
-          await new Promise((resolve) => setTimeout(resolve, 500));
-        } else {
-          console.warn('Gemini request unresolved, applying calculation engine summary:', err?.message || err);
-          return res.json(buildFallbackSummary());
+        const response = await ai.models.generateContent({
+          model: 'gemini-3.8-flash',
+          contents: prompt,
+          config: {
+            systemInstruction:
+              'You are a strict financial analytics AI. You produce concise, exactly 3-sentence executive summaries using only explicitly provided figures.',
+          },
+        });
+        aiText = response.text ? response.text.trim() : '';
+        if (aiText) break;
+      } catch (e: any) {
+        lastError = e;
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 800));
         }
       }
     }
 
-    if (!outputText) {
-      return res.json(buildFallbackSummary());
+    if (!aiText) {
+      const fallbackSummary = generateDeterministicThreeSentenceSummary(payload);
+      return res.json({
+        summary: fallbackSummary,
+        source: 'engine_fallback',
+        error: lastError?.message || undefined,
+      });
     }
 
-    // Split sentences cleanly
-    const rawSentences = outputText
-      .split(/(?<=[.!?])\s+/)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-
     return res.json({
-      summary: outputText,
-      sentences: rawSentences,
-      targetRegion: targetRegionData.region,
+      summary: aiText,
       source: 'gemini-3.8-flash',
     });
   } catch (error: any) {
-    console.error('Server Error:', error);
-    return res.status(500).json({
-      error: error.message || 'Failed to generate AI executive summary',
+    console.error('Gemini summary error:', error);
+    // Graceful fallback so user always gets the accurate 3-sentence summary
+    const fallbackSummary = generateDeterministicThreeSentenceSummary(req.body as AnalysisPayload);
+    return res.json({
+      summary: fallbackSummary,
+      source: 'engine_computed_fallback',
+      error: error.message || 'Gemini service unreachable, generated via certified calculations.',
     });
   }
 });
 
-// Setup Vite development server or static serving
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 async function startServer() {
-  if (process.env.NODE_ENV !== 'production') {
-    const { createServer } = await import('vite');
-    const vite = await createServer({
+  if (!isProd) {
+    const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
+    const distPath = path.resolve(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server listening on port ${PORT}`);
+    console.log(`Server running on http://0.0.0.0:${PORT} (${isProd ? 'production' : 'development'})`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
+});
