@@ -1,0 +1,6 @@
+{
+  "name": "Quarterly Sales Performance & AI Region Analyst",
+  "description": "Upload sales order CSV data to visualize revenue by region and quarter with interactive charts, cross-tab tables, and automated AI analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
